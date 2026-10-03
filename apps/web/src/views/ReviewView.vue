@@ -15,10 +15,11 @@ interface Media {
 interface Annotation {
   id: string; mediaId: string; type: AnnotationType; severity: number; startMs: number | string; endMs: number | string;
   title: string; description: string | null; nextAction: string | null; updatedAt: string;
+  goals?: Array<{ id: string; title: string; status: string }>;
 }
 interface Goal {
   id: string; title: string; category: string; metricType: string; targetValue: number | string; baselineValue: number | string | null;
-  unit: string; dueDate: string; method: string | null; evidenceRequirement: string; status: string;
+  unit: string; dueDate: string; method: string | null; evidenceRequirement: string; status: string; annotationId: string | null;
 }
 interface Review {
   goodPoints: string | null; mainIssues: string | null; nextFocus: string | null; noIssues: boolean; suggestedNextPracticeAt: string | null;
@@ -49,6 +50,11 @@ const playheadMs = ref(0);
 const waveform = ref<InstanceType<typeof WaveformPlayer> | null>(null);
 const uploads = ref<UploadItem[]>([]);
 const dragging = ref(false);
+const selectedAnnotationIds = ref<Set<string>>(new Set());
+const batchType = ref<AnnotationType>("RHYTHM");
+const batchApplyType = ref(false);
+const batchSeverity = ref<number>(3);
+const batchApplySeverity = ref(false);
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const annotationForm = reactive({
@@ -85,6 +91,25 @@ const readyMedia = computed(() => session.value?.mediaAssets.filter((media) => m
 const activeUploads = computed(() => uploads.value.filter((item) => !["READY", "FAILED", "CANCELLED"].includes(item.status)));
 const startMs = computed(() => parseTimeInput(annotationForm.startText) ?? 0);
 const endMs = computed(() => parseTimeInput(annotationForm.endText) ?? 0);
+// 当前选中标记所关联的目标：拖动区间后随标记一起同步展示。
+const linkedGoals = computed(() => {
+  if (!session.value || !selectedAnnotationId.value) return [];
+  return session.value.goals.filter((goal) => goal.annotationId === selectedAnnotationId.value);
+});
+const selectedCount = computed(() => selectedAnnotationIds.value.size);
+
+function isSelected(id: string): boolean {
+  return selectedAnnotationIds.value.has(id);
+}
+function toggleSelected(id: string, checked: boolean): void {
+  const next = new Set(selectedAnnotationIds.value);
+  if (checked) next.add(id);
+  else next.delete(id);
+  selectedAnnotationIds.value = next;
+}
+function clearSelection(): void {
+  selectedAnnotationIds.value = new Set();
+}
 
 async function loadSession(): Promise<void> {
   loading.value = true;
@@ -167,18 +192,108 @@ async function saveAnnotation(): Promise<void> {
     method: annotationForm.id ? "PATCH" : "POST",
     body: JSON.stringify(payload),
   });
-  const index = session.value!.annotations.findIndex((item) => item.id === result.annotation.id);
-  if (index >= 0) session.value!.annotations[index] = result.annotation;
-  else session.value!.annotations.push(result.annotation);
-  session.value!.annotations.sort((a, b) => Number(a.startMs) - Number(b.startMs));
+  upsertAnnotation(result.annotation);
   selectedAnnotationId.value = result.annotation.id;
   annotationForm.id = result.annotation.id;
+}
+
+function upsertAnnotation(annotation: Annotation): void {
+  const index = session.value!.annotations.findIndex((item) => item.id === annotation.id);
+  if (index >= 0) session.value!.annotations[index] = annotation;
+  else session.value!.annotations.push(annotation);
+  session.value!.annotations.sort((a, b) => Number(a.startMs) - Number(b.startMs));
+}
+
+async function persistRangeChange(payload: { id: string; startMs: number; endMs: number }): Promise<void> {
+  if (!session.value) return;
+  const previous = session.value.annotations.find((item) => item.id === payload.id);
+  if (!previous) return;
+  // 乐观更新：波形、表单中的严重度/建议动作/关联目标随之同步。
+  const optimistic: Annotation = { ...previous, startMs: payload.startMs, endMs: payload.endMs };
+  upsertAnnotation(optimistic);
+  if (selectedAnnotationId.value === payload.id) {
+    annotationForm.startText = formatTimeMs(payload.startMs);
+    annotationForm.endText = formatTimeMs(payload.endMs);
+  }
+  try {
+    const result = await apiFetch<{ annotation: Annotation }>(`/api/v1/annotations/${payload.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ startMs: payload.startMs, endMs: payload.endMs }),
+    });
+    upsertAnnotation(result.annotation);
+    if (selectedAnnotationId.value === payload.id) {
+      annotationForm.startText = formatTimeMs(Number(result.annotation.startMs));
+      annotationForm.endText = formatTimeMs(Number(result.annotation.endMs));
+    }
+  } catch (reason) {
+    upsertAnnotation(previous);
+    if (selectedAnnotationId.value === payload.id) {
+      annotationForm.startText = formatTimeMs(Number(previous.startMs));
+      annotationForm.endText = formatTimeMs(Number(previous.endMs));
+    }
+    error.value = reason instanceof ApiError ? reason.message : "区间调整失败，已还原";
+  }
+}
+
+async function applyBatchCorrection(): Promise<void> {
+  if (!session.value || selectedCount.value === 0) return;
+  if (!batchApplyType.value && !batchApplySeverity.value) {
+    error.value = "请先勾选需要批量校正的字段（类型或严重程度）";
+    return;
+  }
+  error.value = "";
+  const ids = [...selectedAnnotationIds.value];
+  try {
+    const result = await apiFetch<{ annotations: Annotation[] }>(`/api/v1/sessions/${session.value.id}/annotations/batch`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        ids,
+        ...(batchApplyType.value ? { type: batchType.value } : {}),
+        ...(batchApplySeverity.value ? { severity: batchSeverity.value } : {}),
+      }),
+    });
+    result.annotations.forEach(upsertAnnotation);
+    const open = result.annotations.find((item) => item.id === selectedAnnotationId.value);
+    if (open) {
+      annotationForm.type = open.type;
+      annotationForm.severity = open.severity;
+    }
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "批量校正失败";
+  }
+}
+
+async function batchDeleteAnnotations(): Promise<void> {
+  if (!session.value || selectedCount.value === 0) return;
+  const ids = [...selectedAnnotationIds.value];
+  if (!window.confirm(`确认删除选中的 ${ids.length} 个问题标记？关联目标仅解除关联，不会被删除。`)) return;
+  error.value = "";
+  try {
+    const result = await apiFetch<{ deletedIds: string[] }>(`/api/v1/sessions/${session.value.id}/annotations/batch-delete`, {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    const deleted = new Set(result.deletedIds);
+    session.value.annotations = session.value.annotations.filter((item) => !deleted.has(item.id));
+    session.value.goals.forEach((goal) => {
+      if (goal.annotationId && deleted.has(goal.annotationId)) goal.annotationId = null;
+    });
+    clearSelection();
+    if (selectedAnnotationId.value && deleted.has(selectedAnnotationId.value)) resetAnnotationForm();
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "批量删除失败";
+  }
 }
 
 async function deleteAnnotation(): Promise<void> {
   if (!annotationForm.id || !window.confirm("确认删除此问题标记？关联目标会自动解除关联。")) return;
   await apiFetch(`/api/v1/annotations/${annotationForm.id}`, { method: "DELETE" });
-  session.value!.annotations = session.value!.annotations.filter((item) => item.id !== annotationForm.id);
+  const deletedId = annotationForm.id;
+  session.value!.annotations = session.value!.annotations.filter((item) => item.id !== deletedId);
+  session.value!.goals.forEach((goal) => {
+    if (goal.annotationId === deletedId) goal.annotationId = null;
+  });
+  selectedAnnotationIds.value.delete(deletedId);
   resetAnnotationForm();
 }
 
@@ -444,14 +559,28 @@ onMounted(loadSession);
             :selected-id="selectedAnnotationId"
             @select="loadAnnotation"
             @position="playheadMs = $event"
+            @range-change="persistRangeChange"
           />
           <article class="card" style="margin-top: 16px">
             <div class="card-title"><h2>问题标记</h2><button class="button small secondary" type="button" :disabled="!selectedMedia || selectedMedia.status !== 'READY'" @click="resetAnnotationForm">新增标记</button></div>
+            <div v-if="session.annotations.length" class="batch-bar">
+              <label class="batch-check"><input type="checkbox" :checked="selectedCount === session.annotations.length" :indeterminate.prop="selectedCount > 0 && selectedCount < session.annotations.length" @change="($event.target as HTMLInputElement).checked ? selectedAnnotationIds = new Set(session.annotations.map((item) => item.id)) : clearSelection()" /> 全选</label>
+              <span class="muted">已选 {{ selectedCount }} 项</span>
+              <div class="batch-actions">
+                <label class="batch-field"><input v-model="batchApplyType" type="checkbox" /><select v-model="batchType" :disabled="!batchApplyType"><option v-for="type in (['RHYTHM', 'FINGERING', 'EMOTION'] as const)" :key="type" :value="type">{{ annotationLabels[type] }}</option></select></label>
+                <label class="batch-field"><input v-model="batchApplySeverity" type="checkbox" /><input v-model.number="batchSeverity" type="number" min="1" max="5" :disabled="!batchApplySeverity" style="width: 56px" /></label>
+                <button class="button small secondary" type="button" :disabled="selectedCount === 0" @click="applyBatchCorrection">批量校正</button>
+                <button class="button small danger" type="button" :disabled="selectedCount === 0" @click="batchDeleteAnnotations">批量删除</button>
+              </div>
+            </div>
             <div v-if="session.annotations.length" class="annotation-list">
-              <button v-for="item in session.annotations" :key="item.id" class="annotation-row" :class="{ active: item.id === selectedAnnotationId }" type="button" @click="loadAnnotation(item.id)">
-                <StatusBadge :value="item.type" kind="annotation" />
-                <span><strong>{{ item.title }}</strong><small>{{ formatTimeMs(Number(item.startMs)) }}–{{ formatTimeMs(Number(item.endMs)) }} · 严重度 {{ item.severity }}</small></span>
-              </button>
+              <div v-for="item in session.annotations" :key="item.id" class="annotation-row" :class="{ active: item.id === selectedAnnotationId }">
+                <label class="row-check" @click.stop><input type="checkbox" :checked="isSelected(item.id)" @change="toggleSelected(item.id, ($event.target as HTMLInputElement).checked)" /></label>
+                <button class="annotation-main" type="button" @click="loadAnnotation(item.id)">
+                  <StatusBadge :value="item.type" kind="annotation" />
+                  <span><strong>{{ item.title }}</strong><small>{{ formatTimeMs(Number(item.startMs)) }}–{{ formatTimeMs(Number(item.endMs)) }} · 严重度 {{ item.severity }}</small></span>
+                </button>
+              </div>
             </div>
             <div v-else class="empty"><strong>还没有问题标记</strong><p>将播放位置定位到问题区间后，在右侧创建第一条标记。</p></div>
           </article>
@@ -473,6 +602,16 @@ onMounted(loadSession);
             <label class="field"><span>短标题</span><input v-model="annotationForm.title" required maxlength="80" /></label>
             <label class="field"><span>详细描述</span><textarea v-model="annotationForm.description" maxlength="2000" /></label>
             <label class="field"><span>建议动作</span><textarea v-model="annotationForm.nextAction" maxlength="1000" /></label>
+            <div v-if="annotationForm.id && linkedGoals.length" class="linked-goals">
+              <small class="muted">拖动区间后同步的关联目标（{{ linkedGoals.length }}）</small>
+              <ul>
+                <li v-for="goal in linkedGoals" :key="goal.id">
+                  <strong>{{ goal.title }}</strong>
+                  <StatusBadge :value="goal.status" kind="goal" />
+                </li>
+              </ul>
+            </div>
+            <p v-else-if="annotationForm.id" class="muted small-hint">该标记暂无关联目标；可在下方“下一次目标”中关联。</p>
             <div class="row end"><button v-if="annotationForm.id" class="button small danger" type="button" @click="deleteAnnotation">删除</button><button class="button small" type="submit">保存标记</button></div>
           </form>
 
@@ -540,9 +679,21 @@ onMounted(loadSession);
 .upload-item { margin-top: 12px; padding: 10px; border-radius: 10px; background: var(--surface-soft); }
 .upload-item .progress-bar { margin-top: 7px; }
 .annotation-list { display: grid; gap: 8px; }
-.annotation-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; text-align: left; cursor: pointer; }
+.batch-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
+.batch-check { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.batch-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.batch-field { display: flex; align-items: center; gap: 5px; }
+.batch-field input[type="checkbox"] { width: auto; }
+.annotation-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px; width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.row-check { display: grid; place-items: center; }
+.row-check input { width: auto; margin: 0; }
+.annotation-main { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; cursor: pointer; }
 .annotation-row.active { border-color: var(--primary); background: #edf7f4; }
-.annotation-row span strong, .annotation-row span small { display: block; }
+.annotation-main span strong, .annotation-main span small { display: block; }
+.linked-goals { padding: 8px 10px; border: 1px dashed var(--line); border-radius: 8px; background: var(--surface-soft); }
+.linked-goals ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.linked-goals li { display: flex; align-items: center; gap: 8px; }
+.small-hint { font-size: .82rem; margin: 2px 0; }
 .boundary { height: 42px; align-self: end; }
 .goal-progress-row, .new-goal { display: grid; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .goal-progress-row:last-child, .new-goal:last-child { border-bottom: 0; }

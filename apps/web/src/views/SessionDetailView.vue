@@ -12,7 +12,7 @@ interface Media {
   sampleRate: number | null; channels: number | null; peaks: number[] | null; failureMessage: string | null;
 }
 interface Annotation { id: string; mediaId: string; type: "RHYTHM" | "FINGERING" | "EMOTION"; title: string; severity: number; startMs: number; endMs: number; description: string | null; nextAction: string | null }
-interface Goal { id: string; title: string; category: string; targetValue: number; baselineValue: number | null; unit: string; dueDate: string; status: string; progresses: Array<{ id: string; actualValue: number; note: string | null; recordedAt: string }> }
+interface Goal { id: string; title: string; category: string; targetValue: number; baselineValue: number | null; unit: string; dueDate: string; status: string; annotationId: string | null; annotation: Pick<Annotation, "id" | "title" | "startMs" | "endMs"> | null; progresses: Array<{ id: string; actualValue: number; note: string | null; recordedAt: string }> }
 interface Session {
   id: string; title: string; instrument: string; focus: string | null; location: string | null; notes: string | null; status: string; startedAt: string;
   completedAt: string | null; actualDurationMs: number; mediaAssets: Media[]; annotations: Annotation[]; goals: Goal[];
@@ -161,6 +161,7 @@ onMounted(load);
               <div v-for="goal in session.goals" :key="goal.id" class="goal-detail">
                 <div class="row between"><strong>{{ goal.title }}</strong><StatusBadge :value="goal.status" kind="goal" /></div>
                 <small>目标 {{ goal.targetValue }} {{ goal.unit }} · 截止 {{ goal.dueDate.slice(0, 10) }}</small>
+                <small v-if="goal.annotation">关联标记：{{ goal.annotation.title }}（{{ formatTimeMs(goal.annotation.startMs) }}–{{ formatTimeMs(goal.annotation.endMs) }}）</small>
                 <div v-if="goal.progresses.length">
                   <div v-for="progress in goal.progresses" :key="progress.id" class="progress-record">
                     <span>{{ progress.actualValue }} {{ goal.unit }}</span><small>{{ formatDateTime(progress.recordedAt) }} · {{ progress.note || "无备注" }}</small>

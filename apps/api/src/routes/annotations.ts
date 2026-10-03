@@ -1,8 +1,16 @@
 import type { FastifyPluginAsync } from "fastify";
-import { annotationCreateSchema, annotationListQuerySchema, annotationUpdateSchema, validateAnnotationRange } from "@practice/contracts";
+import {
+  annotationBatchDeleteSchema,
+  annotationBatchUpdateSchema,
+  annotationCreateSchema,
+  annotationListQuerySchema,
+  annotationUpdateSchema,
+  validateAnnotationRange,
+} from "@practice/contracts";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { parseOrThrow } from "../lib/validation.js";
+import { audit } from "../lib/audit.js";
 
 const annotationRoutes: FastifyPluginAsync = async (app) => {
   app.addHook("preHandler", app.authenticate);
@@ -83,12 +91,106 @@ const annotationRoutes: FastifyPluginAsync = async (app) => {
     return { annotation };
   });
 
+  // 批量校正：对同一练习内的多个标记统一调整类型 / 严重度，整笔事务提交。
+  app.patch("/sessions/:sessionId/annotations/batch", async (request) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const input = parseOrThrow(annotationBatchUpdateSchema, request.body);
+    const session = await prisma.practiceSession.findFirst({
+      where: { id: sessionId, userId: request.authUser!.id },
+      select: { id: true },
+    });
+    if (!session) throw notFound();
+
+    const ids = [...new Set(input.ids)];
+    const owned = await prisma.annotation.findMany({
+      where: { id: { in: ids }, sessionId, userId: request.authUser!.id },
+      select: { id: true },
+    });
+    if (owned.length !== ids.length) {
+      throw new AppError(400, "VALIDATION_ERROR", "部分标记不存在或不属于当前练习");
+    }
+
+    const data = {
+      ...(input.type === undefined ? {} : { type: input.type }),
+      ...(input.severity === undefined ? {} : { severity: input.severity }),
+    };
+    const annotations = await prisma.$transaction(async (tx) => {
+      await tx.annotation.updateMany({ where: { id: { in: ids }, sessionId, userId: request.authUser!.id }, data });
+      return tx.annotation.findMany({
+        where: { id: { in: ids } },
+        orderBy: [{ startMs: "asc" }, { createdAt: "asc" }],
+        include: { goals: { select: { id: true, title: true, status: true } } },
+      });
+    });
+    return { annotations };
+  });
+
+  // 批量删除：只解除目标关联，目标本体保留，避免悬空 annotation_id。
+  app.post("/sessions/:sessionId/annotations/batch-delete", async (request) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const input = parseOrThrow(annotationBatchDeleteSchema, request.body);
+    const session = await prisma.practiceSession.findFirst({
+      where: { id: sessionId, userId: request.authUser!.id },
+      select: { id: true },
+    });
+    if (!session) throw notFound();
+
+    const ids = [...new Set(input.ids)];
+    const result = await prisma.$transaction(async (tx) => {
+      const rows = await tx.annotation.findMany({
+        where: { id: { in: ids }, sessionId, userId: request.authUser!.id },
+        select: { id: true },
+      });
+      const foundIds = rows.map((row) => row.id);
+      const unlinked = await tx.goal.updateMany({
+        where: { annotationId: { in: foundIds }, userId: request.authUser!.id },
+        data: { annotationId: null },
+      });
+      const deleted = await tx.annotation.deleteMany({
+        where: { id: { in: foundIds }, userId: request.authUser!.id },
+      });
+      return { foundIds, deletedCount: deleted.count, unlinkedCount: unlinked.count };
+    });
+
+    await audit(request, "ANNOTATION_BATCH_DELETED", "ANNOTATION", null, "SUCCESS", {
+      sessionId,
+      count: result.deletedCount,
+      unlinkedGoals: result.unlinkedCount,
+    }).catch(() => undefined);
+
+    return {
+      success: true,
+      deletedIds: result.foundIds,
+      deletedCount: result.deletedCount,
+      unlinkedGoalCount: result.unlinkedCount,
+    };
+  });
+
   app.delete("/annotations/:id", async (request) => {
     const { id } = request.params as { id: string };
-    const existing = await prisma.annotation.findFirst({ where: { id, userId: request.authUser!.id }, select: { id: true } });
-    if (!existing) throw notFound();
-    await prisma.annotation.delete({ where: { id } });
-    return { success: true };
+    // 并发删除时另一个请求可能已经完成删除：
+    // 同一事务里先解除目标关联再删除标记，保证不留下悬空引用，且结果幂等。
+    const result = await prisma.$transaction(async (tx) => {
+      const existing = await tx.annotation.findFirst({
+        where: { id, userId: request.authUser!.id },
+        select: { id: true, sessionId: true },
+      });
+      if (!existing) return null;
+      const unlinked = await tx.goal.updateMany({
+        where: { annotationId: id, userId: request.authUser!.id },
+        data: { annotationId: null },
+      });
+      await tx.annotation.deleteMany({ where: { id, userId: request.authUser!.id } });
+      return { sessionId: existing.sessionId, unlinkedCount: unlinked.count };
+    });
+    if (!result) return { success: true, deletedCount: 0, unlinkedGoalCount: 0 };
+
+    await audit(request, "ANNOTATION_DELETED", "ANNOTATION", id, "SUCCESS", {
+      sessionId: result.sessionId,
+      unlinkedGoals: result.unlinkedCount,
+    }).catch(() => undefined);
+
+    return { success: true, deletedCount: 1, unlinkedGoalCount: result.unlinkedCount };
   });
 };
 

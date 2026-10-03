@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  annotationBatchDeleteSchema,
+  annotationBatchUpdateSchema,
   calculateSessionDuration,
   canTransitionSession,
+  clampAnnotationRange,
   describeMissingReview,
   isGoalProgressValid,
   validateAnnotationRange,
@@ -19,6 +22,45 @@ describe("annotation range", () => {
     expect(validateAnnotationRange(100, 150, 1000)).toMatchObject({ ok: false });
     expect(validateAnnotationRange(900, 1100, 1000)).toMatchObject({ ok: false });
     expect(validateAnnotationRange(100, 250, 1000)).toEqual({ ok: true });
+  });
+});
+
+describe("drag range clamping", () => {
+  it("keeps a minimum 100ms span and snaps to 10ms", () => {
+    expect(clampAnnotationRange(100, 150, 1000, "move")).toEqual({ startMs: 100, endMs: 200 });
+  });
+
+  it("clamps moving the whole region back inside the media duration", () => {
+    expect(clampAnnotationRange(950, 1100, 1000, "move")).toEqual({ startMs: 900, endMs: 1000 });
+  });
+
+  it("prevents the start handle from overtaking the end handle", () => {
+    expect(clampAnnotationRange(900, 500, 1000, "start")).toEqual({ startMs: 400, endMs: 500 });
+  });
+
+  it("extends the end handle while keeping at least 100ms and inside media", () => {
+    expect(clampAnnotationRange(500, 540, 1000, "end")).toEqual({ startMs: 500, endMs: 600 });
+    expect(clampAnnotationRange(950, 1300, 1000, "end")).toEqual({ startMs: 900, endMs: 1000 });
+  });
+
+  it("never returns a negative start and supports unknown duration", () => {
+    const moved = clampAnnotationRange(-300, -250, null, "move");
+    expect(moved.startMs).toBe(0);
+    expect(moved.endMs - moved.startMs).toBeGreaterThanOrEqual(100);
+  });
+});
+
+describe("annotation batch schemas", () => {
+  const id = "11111111-1111-4111-8111-111111111111";
+
+  it("accepts a batch update with at least one field", () => {
+    expect(annotationBatchUpdateSchema.parse({ ids: [id], severity: 2 })).toMatchObject({ severity: 2 });
+    expect(annotationBatchUpdateSchema.parse({ ids: [id], type: "EMOTION" })).toMatchObject({ type: "EMOTION" });
+  });
+
+  it("rejects an empty patch or empty id list", () => {
+    expect(annotationBatchUpdateSchema.safeParse({ ids: [id] }).success).toBe(false);
+    expect(annotationBatchDeleteSchema.safeParse({ ids: [] }).success).toBe(false);
   });
 });
 

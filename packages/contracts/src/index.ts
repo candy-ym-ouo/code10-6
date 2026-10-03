@@ -122,6 +122,18 @@ export const annotationCreateSchema = annotationCreateBaseSchema
     message: "标记区间至少 100 毫秒",
   });
 export const annotationUpdateSchema = annotationCreateBaseSchema.partial().omit({ mediaId: true });
+export const annotationBatchUpdateSchema = z
+  .object({
+    ids: z.array(z.string().uuid()).min(1, "至少选择一个标记").max(100, "单次最多批量校正 100 个标记"),
+    type: z.enum(ANNOTATION_TYPES).optional(),
+    severity: z.coerce.number().int().min(1).max(5).optional(),
+  })
+  .refine((value) => value.type !== undefined || value.severity !== undefined, {
+    message: "至少提供一个需要批量校正的字段",
+  });
+export const annotationBatchDeleteSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1, "至少选择一个标记").max(100, "单次最多批量删除 100 个标记"),
+});
 export const annotationListQuerySchema = z.object({
   mediaId: z.string().uuid().optional(),
   type: z.enum(ANNOTATION_TYPES).optional(),
@@ -255,6 +267,48 @@ export function validateAnnotationRange(
 
 export function isGoalProgressValid(actualValue: number, targetValue: number): boolean {
   return Number.isFinite(actualValue) && Number.isFinite(targetValue) && actualValue >= targetValue;
+}
+
+/**
+ * 将拖动得到的区间端点收敛到合法范围：
+ * 保持非负、至少 100 ms、且不超过音频时长。
+ * mode 区分整段平移（move）与只拖起点/终点。
+ */
+export function clampAnnotationRange(
+  startMs: number,
+  endMs: number,
+  durationMs?: number | null,
+  mode: "move" | "start" | "end" = "move",
+  snapMs = 10,
+): { startMs: number; endMs: number } {
+  const MIN_SPAN = 100;
+  const upper = durationMs != null && durationMs > 0 ? Math.floor(durationMs) : null;
+  const snap = (value: number): number => {
+    let rounded = Math.round(value / snapMs) * snapMs;
+    rounded = Math.max(0, rounded);
+    return upper != null ? Math.min(rounded, upper) : rounded;
+  };
+
+  let start = snap(startMs);
+  let end = snap(endMs);
+
+  if (mode === "start") {
+    start = Math.min(start, end - MIN_SPAN);
+  } else if (mode === "end") {
+    end = Math.max(end, start + MIN_SPAN);
+  } else {
+    const span = Math.max(end - start, MIN_SPAN);
+    if (upper != null && start + span > upper) start = Math.max(0, upper - span);
+    end = start + span;
+  }
+
+  start = Math.max(0, start);
+  end = Math.max(end, start + MIN_SPAN);
+  if (upper != null) {
+    end = Math.min(end, upper);
+    start = Math.min(start, Math.max(0, end - MIN_SPAN));
+  }
+  return { startMs: start, endMs: end };
 }
 
 export function calculateSessionDuration(mediaDurationsMs: Array<number | null | undefined>): number {

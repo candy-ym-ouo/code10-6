@@ -91,12 +91,30 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/sessions/:sessionId/annotations` | 标记列表 |
+| GET | `/sessions/:sessionId/annotations` | 标记列表，含每个标记关联的目标 |
 | POST | `/sessions/:sessionId/annotations` | 新增标记 |
-| PATCH | `/annotations/:id` | 编辑标记 |
-| DELETE | `/annotations/:id` | 删除标记 |
+| PATCH | `/annotations/:id` | 编辑标记（含拖动后的区间） |
+| DELETE | `/annotations/:id` | 删除标记；并发重复删除返回幂等成功 |
+| PATCH | `/sessions/:sessionId/annotations/batch` | 批量校正类型/严重度 |
+| POST | `/sessions/:sessionId/annotations/batch-delete` | 批量删除标记 |
 
 区间使用毫秒整数，最小时长 100 ms，且不能超过音频时长。问题类型为 `RHYTHM`、`FINGERING` 或 `EMOTION`。
+
+拖动波形上的标记会先在本地按 10 ms 吸附并收敛到合法区间（非负、至少 100 ms、不超出时长），松开后通过 `PATCH /annotations/:id` 持久化新的 `startMs/endMs`，界面上的严重度、建议动作与关联目标随同一标记同步展示。
+
+批量校正请求体：
+
+```json
+{
+  "ids": ["<uuid>", "<uuid>"],
+  "type": "RHYTHM",
+  "severity": 4
+}
+```
+
+`type` 与 `severity` 至少提供一个；`ids` 去重后 1–100 个，且必须全部属于当前练习，否则整体拒绝（不会部分写入）。响应返回更新后的标记列表。
+
+批量删除请求体只需 `ids`。删除只解除目标关联（`goals.annotation_id` 置空），目标本体保留；响应包含 `deletedIds`、`deletedCount` 和解除关联的 `unlinkedGoalCount`。单条删除使用同样的「先解除关系再删除」事务，因此并发删除或标记已被其他请求删掉时不会留下悬空引用，也不会报 5xx。
 
 ## 复盘与目标
 

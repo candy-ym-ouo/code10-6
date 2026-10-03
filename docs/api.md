@@ -94,9 +94,23 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 | GET | `/sessions/:sessionId/annotations` | 标记列表 |
 | POST | `/sessions/:sessionId/annotations` | 新增标记 |
 | PATCH | `/annotations/:id` | 编辑标记 |
+| PATCH | `/sessions/:sessionId/annotations/batch` | 批量校正标记 |
 | DELETE | `/annotations/:id` | 删除标记 |
 
 区间使用毫秒整数，最小时长 100 ms，且不能超过音频时长。问题类型为 `RHYTHM`、`FINGERING` 或 `EMOTION`。
+
+批量校正请求在一个事务内完成，任一条标记不存在或被并发删除时整体回滚（返回 404 或 `ANNOTATIONS_CHANGED`），不会出现部分写入：
+
+```json
+{
+  "ids": ["uuid-a", "uuid-b"],
+  "type": "RHYTHM",
+  "severity": 4,
+  "nextAction": "节拍器降到 60 BPM 分段慢练"
+}
+```
+
+`ids` 去重后 1–100 个；`type`、`severity`、`nextAction` 至少提供一个；`nextAction` 传 `null` 表示清空建议动作，缺省字段保持原值。删除标记只解除关系：同一事务内先把关联目标的 `annotationId` 置空，再删除标记，任何情况下都不会留下悬空引用；重复删除返回 404。
 
 ## 复盘与目标
 

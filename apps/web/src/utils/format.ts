@@ -37,6 +37,11 @@ export function parseTimeInput(value: string): number | null {
   return minutes * 60_000 + seconds * 1000 + millis;
 }
 
+export function clampTimeMs(value: number, min: number, max: number): number {
+  if (max < min) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
 export function formatBytes(value: number | bigint): string {
   const bytes = Number(value);
   if (bytes < 1024) return `${bytes} B`;

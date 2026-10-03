@@ -122,6 +122,17 @@ export const annotationCreateSchema = annotationCreateBaseSchema
     message: "标记区间至少 100 毫秒",
   });
 export const annotationUpdateSchema = annotationCreateBaseSchema.partial().omit({ mediaId: true });
+export const annotationBatchUpdateSchema = z
+  .object({
+    ids: z.array(z.string().uuid()).min(1, "请至少选择一个标记").max(100, "单次最多校正 100 个标记"),
+    type: z.enum(ANNOTATION_TYPES).optional(),
+    severity: z.coerce.number().int().min(1).max(5).optional(),
+    nextAction: z.string().trim().max(1000, "建议动作不能超过 1000 个字符").nullable().optional(),
+  })
+  .refine(
+    (value) => value.type !== undefined || value.severity !== undefined || value.nextAction !== undefined,
+    { message: "至少指定一个需要批量校正的字段" },
+  );
 export const annotationListQuerySchema = z.object({
   mediaId: z.string().uuid().optional(),
   type: z.enum(ANNOTATION_TYPES).optional(),
@@ -251,6 +262,55 @@ export function validateAnnotationRange(
     return { ok: false, code: "AUDIO_RANGE_INVALID", message: "标记结束时间不能超出音频时长" };
   }
   return { ok: true };
+}
+
+export const ANNOTATION_MIN_SPAN_MS = 100;
+
+export type AnnotationDragMode = "start" | "end" | "move";
+
+/**
+ * 拖动标记区间时在客户端实时约束范围：非负、最小区间 100ms 且不超出音频时长。
+ * - "start"：拖左端点，终点不动，起点最多退到 endMs - minSpan；
+ * - "end"：拖右端点，起点不动，终点至少推到 startMs + minSpan；
+ * - "move"：整段平移，保持宽度，越界则贴边；
+ * - 缺省：以起点优先做一次通用归一化。
+ */
+export function clampAnnotationRange(
+  startMs: number,
+  endMs: number,
+  durationMs: number | null | undefined,
+  minSpanMs: number = ANNOTATION_MIN_SPAN_MS,
+  mode: AnnotationDragMode | "normal" = "normal",
+): { startMs: number; endMs: number } {
+  const total =
+    Number.isFinite(durationMs as number) && (durationMs as number) > 0 ? Math.floor(durationMs as number) : null;
+  const maxEnd = total ?? Number.POSITIVE_INFINITY;
+  const maxStart = total != null ? total - minSpanMs : Number.POSITIVE_INFINITY;
+
+  let start = Math.round(startMs);
+  let end = Math.round(endMs);
+
+  if (mode === "start") {
+    start = Math.min(Math.max(start, 0), Math.max(0, end - minSpanMs), maxStart);
+    end = Math.max(end, start + minSpanMs);
+    if (total != null) end = Math.min(end, total);
+  } else if (mode === "end") {
+    start = Math.min(Math.max(start, 0), maxStart);
+    end = Math.min(Math.max(end, start + minSpanMs), maxEnd);
+  } else if (mode === "move") {
+    const span = Math.max(minSpanMs, end - start);
+    const shifted = Math.min(Math.max(start, 0), Math.max(0, (total ?? start + span) - span));
+    start = shifted;
+    end = shifted + span;
+  } else {
+    start = Math.min(Math.max(start, 0), Math.max(0, maxStart));
+    end = Math.max(end, start + minSpanMs);
+    if (end > maxEnd) {
+      end = maxEnd;
+      start = Math.max(0, Math.min(start, end - minSpanMs));
+    }
+  }
+  return { startMs: start, endMs: end };
 }
 
 export function isGoalProgressValid(actualValue: number, targetValue: number): boolean {

@@ -5,7 +5,7 @@ import { createSHA256 } from "hash-wasm";
 import WaveformPlayer, { type WaveAnnotation } from "../components/WaveformPlayer.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { apiFetch, ApiError } from "../api/client.js";
-import { annotationLabels, formatBytes, formatTimeMs, parseTimeInput } from "../utils/format.js";
+import { annotationLabels, formatBytes, formatTimeMs, goalStatusLabels, parseTimeInput } from "../utils/format.js";
 
 type AnnotationType = "RHYTHM" | "FINGERING" | "EMOTION";
 interface Media {
@@ -18,7 +18,7 @@ interface Annotation {
 }
 interface Goal {
   id: string; title: string; category: string; metricType: string; targetValue: number | string; baselineValue: number | string | null;
-  unit: string; dueDate: string; method: string | null; evidenceRequirement: string; status: string;
+  unit: string; dueDate: string; method: string | null; evidenceRequirement: string; status: string; version: number; annotationId: string | null;
 }
 interface Review {
   goodPoints: string | null; mainIssues: string | null; nextFocus: string | null; noIssues: boolean; suggestedNextPracticeAt: string | null;
@@ -49,6 +49,10 @@ const playheadMs = ref(0);
 const waveform = ref<InstanceType<typeof WaveformPlayer> | null>(null);
 const uploads = ref<UploadItem[]>([]);
 const dragging = ref(false);
+const selectedAnnotationIds = ref<Set<string>>(new Set());
+const batchForm = reactive({ severity: 3, nextAction: "", applyNextAction: false });
+const batchSaving = ref(false);
+const linkGoalId = ref("");
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const annotationForm = reactive({
@@ -81,6 +85,12 @@ const waveAnnotations = computed<WaveAnnotation[]>(() =>
     })),
 );
 const openGoals = computed(() => session.value?.goals.filter((goal) => ["OPEN", "IN_PROGRESS"].includes(goal.status)) ?? []);
+const selectedAnnotationGoals = computed(
+  () => session.value?.goals.filter((goal) => goal.annotationId === selectedAnnotationId.value) ?? [],
+);
+const linkableGoals = computed(
+  () => openGoals.value.filter((goal) => goal.annotationId !== selectedAnnotationId.value),
+);
 const readyMedia = computed(() => session.value?.mediaAssets.filter((media) => media.status === "READY") ?? []);
 const activeUploads = computed(() => uploads.value.filter((item) => !["READY", "FAILED", "CANCELLED"].includes(item.status)));
 const startMs = computed(() => parseTimeInput(annotationForm.startText) ?? 0);
@@ -130,6 +140,46 @@ function loadAnnotation(id: string): void {
   if (!item) return;
   selectedAnnotationId.value = id;
   selectedMediaId.value = item.mediaId;
+  applyAnnotationToForm(item);
+  linkGoalId.value = "";
+  void selectMedia(item.mediaId);
+}
+
+function setBoundary(boundary: "start" | "end"): void {
+  if (boundary === "start") annotationForm.startText = formatTimeMs(playheadMs.value);
+  else annotationForm.endText = formatTimeMs(playheadMs.value);
+}
+
+async function saveAnnotation(patch: Partial<{ type: AnnotationType; severity: number; startMs: number; endMs: number; title: string; description: string | null; nextAction: string | null; mediaId: string }> = {}): Promise<Annotation> {
+  if (!selectedMedia.value) throw new Error("请先选择音频");
+  const isNew = !annotationForm.id;
+  if (isNew && !annotationForm.title.trim()) throw new Error("请填写短标题");
+  const endpoint = isNew ? `/api/v1/sessions/${session.value!.id}/annotations` : `/api/v1/annotations/${annotationForm.id}`;
+  const payload: Record<string, unknown> = {
+    type: annotationForm.type,
+    severity: annotationForm.severity,
+    startMs: startMs.value,
+    endMs: endMs.value,
+    title: annotationForm.title.trim(),
+    description: annotationForm.description || null,
+    nextAction: annotationForm.nextAction || null,
+    ...patch,
+  };
+  if (isNew) payload.mediaId = selectedMedia.value.id;
+  const result = await apiFetch<{ annotation: Annotation }>(endpoint, {
+    method: isNew ? "POST" : "PATCH",
+    body: JSON.stringify(payload),
+  });
+  const index = session.value!.annotations.findIndex((item) => item.id === result.annotation.id);
+  if (index >= 0) session.value!.annotations[index] = result.annotation;
+  else session.value!.annotations.push(result.annotation);
+  session.value!.annotations.sort((a, b) => Number(a.startMs) - Number(b.startMs));
+  selectedAnnotationId.value = result.annotation.id;
+  annotationForm.id = result.annotation.id;
+  return result.annotation;
+}
+
+function applyAnnotationToForm(item: Annotation): void {
   Object.assign(annotationForm, {
     id: item.id,
     type: item.type,
@@ -140,46 +190,124 @@ function loadAnnotation(id: string): void {
     description: item.description ?? "",
     nextAction: item.nextAction ?? "",
   });
-  void selectMedia(item.mediaId);
 }
 
-function setBoundary(boundary: "start" | "end"): void {
-  if (boundary === "start") annotationForm.startText = formatTimeMs(playheadMs.value);
-  else annotationForm.endText = formatTimeMs(playheadMs.value);
+async function onMarkerRangeChange(payload: { id: string; startMs: number; endMs: number }): Promise<void> {
+  const item = session.value?.annotations.find((annotation) => annotation.id === payload.id);
+  if (!item) return;
+  // 立即把拖动结果同步到表单：区间、严重度、建议动作始终读取同一条标记，避免显示旧值。
+  selectedAnnotationId.value = payload.id;
+  if (item.mediaId !== selectedMediaId.value) await selectMedia(item.mediaId);
+  applyAnnotationToForm({ ...item, startMs: payload.startMs, endMs: payload.endMs });
+  try {
+    const updated = await saveAnnotation({ startMs: payload.startMs, endMs: payload.endMs });
+    // 持久化后用服务端返回值再次对齐（可能有边界钳制），关联目标随 id 自动指向新区间。
+    applyAnnotationToForm(updated);
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "区间保存失败，请重试";
+    applyAnnotationToForm(item);
+  }
 }
 
-async function saveAnnotation(): Promise<void> {
-  if (!selectedMedia.value) throw new Error("请先选择音频");
-  if (!annotationForm.title.trim()) throw new Error("请填写短标题");
-  if (endMs.value <= startMs.value) throw new Error("结束时间必须晚于开始时间");
-  const endpoint = annotationForm.id ? `/api/v1/annotations/${annotationForm.id}` : `/api/v1/sessions/${session.value!.id}/annotations`;
-  const payload: Record<string, unknown> = {
-    type: annotationForm.type,
-    severity: annotationForm.severity,
-    startMs: startMs.value,
-    endMs: endMs.value,
-    title: annotationForm.title.trim(),
-    description: annotationForm.description || null,
-    nextAction: annotationForm.nextAction || null,
-  };
-  if (!annotationForm.id) payload.mediaId = selectedMedia.value.id;
-  const result = await apiFetch<{ annotation: Annotation }>(endpoint, {
-    method: annotationForm.id ? "PATCH" : "POST",
-    body: JSON.stringify(payload),
-  });
-  const index = session.value!.annotations.findIndex((item) => item.id === result.annotation.id);
-  if (index >= 0) session.value!.annotations[index] = result.annotation;
-  else session.value!.annotations.push(result.annotation);
-  session.value!.annotations.sort((a, b) => Number(a.startMs) - Number(b.startMs));
-  selectedAnnotationId.value = result.annotation.id;
-  annotationForm.id = result.annotation.id;
+async function submitAnnotationForm(): Promise<void> {
+  try {
+    await saveAnnotation();
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : "标记保存失败";
+  }
 }
 
 async function deleteAnnotation(): Promise<void> {
   if (!annotationForm.id || !window.confirm("确认删除此问题标记？关联目标会自动解除关联。")) return;
-  await apiFetch(`/api/v1/annotations/${annotationForm.id}`, { method: "DELETE" });
-  session.value!.annotations = session.value!.annotations.filter((item) => item.id !== annotationForm.id);
-  resetAnnotationForm();
+  const id = annotationForm.id;
+  try {
+    const result = await apiFetch<{ success: boolean; unlinkedGoalIds: string[] }>(`/api/v1/annotations/${id}`, { method: "DELETE" });
+    for (const goalId of result.unlinkedGoalIds) {
+      const goal = session.value!.goals.find((item) => item.id === goalId);
+      if (goal) goal.annotationId = null;
+    }
+  } catch (reason) {
+    // 并发场景：另一个窗口已经删除（404），本地同样移除即可，目标关联已由服务端解除。
+    if (!(reason instanceof ApiError && reason.status === 404)) {
+      error.value = reason instanceof ApiError ? reason.message : "删除失败，请重试";
+      return;
+    }
+  }
+  session.value!.annotations = session.value!.annotations.filter((item) => item.id !== id);
+  selectedAnnotationIds.value.delete(id);
+  if (selectedAnnotationId.value === id) resetAnnotationForm();
+}
+
+function toggleAnnotationSelection(id: string, checked: boolean): void {
+  const next = new Set(selectedAnnotationIds.value);
+  if (checked) next.add(id);
+  else next.delete(id);
+  selectedAnnotationIds.value = next;
+}
+
+function clearAnnotationSelection(): void {
+  selectedAnnotationIds.value = new Set();
+}
+
+async function applyBatchCorrection(): Promise<void> {
+  const ids = [...selectedAnnotationIds.value];
+  if (!ids.length || batchSaving.value) return;
+  batchSaving.value = true;
+  error.value = "";
+  try {
+    const payload: Record<string, unknown> = { ids, severity: batchForm.severity };
+    if (batchForm.applyNextAction) payload.nextAction = batchForm.nextAction.trim() || null;
+    const result = await apiFetch<{ annotations: Annotation[] }>(
+      `/api/v1/sessions/${session.value!.id}/annotations/batch`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+    );
+    for (const updated of result.annotations) {
+      const index = session.value!.annotations.findIndex((item) => item.id === updated.id);
+      if (index >= 0) session.value!.annotations[index] = updated;
+      if (updated.id === annotationForm.id) applyAnnotationToForm(updated);
+    }
+    selectedAnnotationIds.value = new Set();
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "批量校正失败，请刷新后重试";
+  } finally {
+    batchSaving.value = false;
+  }
+}
+
+async function linkGoalToAnnotation(): Promise<void> {
+  if (!selectedAnnotationId.value || !linkGoalId.value) return;
+  const goal = session.value!.goals.find((item) => item.id === linkGoalId.value);
+  if (!goal) return;
+  try {
+    const result = await apiFetch<{ goal: Goal }>(`/api/v1/goals/${goal.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ version: goal.version, annotationId: selectedAnnotationId.value }),
+    });
+    syncGoal(result.goal);
+    linkGoalId.value = "";
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "关联目标失败";
+  }
+}
+
+async function unlinkGoalFromAnnotation(goalId: string): Promise<void> {
+  const goal = session.value!.goals.find((item) => item.id === goalId);
+  if (!goal) return;
+  try {
+    const result = await apiFetch<{ goal: Goal }>(`/api/v1/goals/${goalId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ version: goal.version, annotationId: null }),
+    });
+    syncGoal(result.goal);
+  } catch (reason) {
+    error.value = reason instanceof ApiError ? reason.message : "解除关联失败";
+  }
+}
+
+function syncGoal(updated: Goal): void {
+  const index = session.value!.goals.findIndex((item) => item.id === updated.id);
+  if (index >= 0) session.value!.goals[index] = updated;
+  else session.value!.goals.unshift(updated);
 }
 
 function mediaType(file: File): string {
@@ -444,21 +572,42 @@ onMounted(loadSession);
             :selected-id="selectedAnnotationId"
             @select="loadAnnotation"
             @position="playheadMs = $event"
+            @rangechange="onMarkerRangeChange"
           />
           <article class="card" style="margin-top: 16px">
             <div class="card-title"><h2>问题标记</h2><button class="button small secondary" type="button" :disabled="!selectedMedia || selectedMedia.status !== 'READY'" @click="resetAnnotationForm">新增标记</button></div>
+            <div v-if="selectedAnnotationIds.size" class="batch-bar">
+              <strong>批量校正（{{ selectedAnnotationIds.size }} 个标记）</strong>
+              <label class="field"><span>统一严重程度：{{ batchForm.severity }}</span><input v-model.number="batchForm.severity" type="range" min="1" max="5" /></label>
+              <label class="row checkbox"><input v-model="batchForm.applyNextAction" style="width: auto" type="checkbox" /> 覆盖建议动作</label>
+              <label v-if="batchForm.applyNextAction" class="field" style="flex: 1"><span>统一建议动作（留空清空）</span><input v-model="batchForm.nextAction" maxlength="1000" placeholder="例如：节拍器降到 60 BPM 分段慢练" /></label>
+              <div class="row end">
+                <button class="button small ghost" type="button" :disabled="batchSaving" @click="clearAnnotationSelection">取消</button>
+                <button class="button small" type="button" :disabled="batchSaving" @click="applyBatchCorrection">{{ batchSaving ? "校正中…" : "应用校正" }}</button>
+              </div>
+            </div>
             <div v-if="session.annotations.length" class="annotation-list">
-              <button v-for="item in session.annotations" :key="item.id" class="annotation-row" :class="{ active: item.id === selectedAnnotationId }" type="button" @click="loadAnnotation(item.id)">
-                <StatusBadge :value="item.type" kind="annotation" />
-                <span><strong>{{ item.title }}</strong><small>{{ formatTimeMs(Number(item.startMs)) }}–{{ formatTimeMs(Number(item.endMs)) }} · 严重度 {{ item.severity }}</small></span>
-              </button>
+              <div v-for="item in session.annotations" :key="item.id" class="annotation-row-wrap">
+                <input
+                  type="checkbox"
+                  class="annotation-select"
+                  style="width: auto"
+                  :checked="selectedAnnotationIds.has(item.id)"
+                  @change="toggleAnnotationSelection(item.id, ($event.target as HTMLInputElement).checked)"
+                  :aria-label="`选择标记 ${item.title} 用于批量校正`"
+                />
+                <button class="annotation-row" :class="{ active: item.id === selectedAnnotationId }" type="button" @click="loadAnnotation(item.id)">
+                  <StatusBadge :value="item.type" kind="annotation" />
+                  <span><strong>{{ item.title }}</strong><small>{{ formatTimeMs(Number(item.startMs)) }}–{{ formatTimeMs(Number(item.endMs)) }} · 严重度 {{ item.severity }}</small></span>
+                </button>
+              </div>
             </div>
             <div v-else class="empty"><strong>还没有问题标记</strong><p>将播放位置定位到问题区间后，在右侧创建第一条标记。</p></div>
           </article>
         </main>
 
         <aside class="review-side">
-          <form class="card stack" @submit.prevent="saveAnnotation">
+          <form class="card stack" @submit.prevent="submitAnnotationForm">
             <div class="card-title"><h2>{{ annotationForm.id ? "编辑标记" : "新增标记" }}</h2><button v-if="annotationForm.id" class="button small ghost" type="button" @click="setLoopFromAnnotation">循环此区间</button></div>
             <div class="row">
               <label class="field" style="flex: 1"><span>开始</span><input v-model="annotationForm.startText" /></label>
@@ -475,6 +624,27 @@ onMounted(loadSession);
             <label class="field"><span>建议动作</span><textarea v-model="annotationForm.nextAction" maxlength="1000" /></label>
             <div class="row end"><button v-if="annotationForm.id" class="button small danger" type="button" @click="deleteAnnotation">删除</button><button class="button small" type="submit">保存标记</button></div>
           </form>
+
+          <section v-if="annotationForm.id" class="card stack linked-goals">
+            <div class="card-title"><h2>关联目标</h2></div>
+            <p v-if="!selectedAnnotationGoals.length" class="muted">还没有目标关联此标记；拖动区间校正后关联保持不变。</p>
+            <div v-for="goal in selectedAnnotationGoals" :key="goal.id" class="linked-goal-row">
+              <div>
+                <strong>{{ goal.title }}</strong>
+                <small>{{ goalStatusLabels[goal.status as keyof typeof goalStatusLabels] ?? goal.status }} · 目标 {{ goal.targetValue }} {{ goal.unit }}</small>
+              </div>
+              <button class="button small ghost" type="button" @click="unlinkGoalFromAnnotation(goal.id)">解除关联</button>
+            </div>
+            <div v-if="linkableGoals.length" class="row">
+              <label class="field" style="flex: 1"><span class="sr-only">选择目标</span>
+                <select v-model="linkGoalId">
+                  <option value="">选择要关联的目标…</option>
+                  <option v-for="goal in linkableGoals" :key="goal.id" :value="goal.id">{{ goal.title }}</option>
+                </select>
+              </label>
+              <button class="button small secondary" type="button" :disabled="!linkGoalId" @click="linkGoalToAnnotation">关联</button>
+            </div>
+          </section>
 
           <form class="card stack" @submit.prevent="saveReview">
             <div class="card-title"><h2>复盘总结</h2></div>
@@ -540,9 +710,17 @@ onMounted(loadSession);
 .upload-item { margin-top: 12px; padding: 10px; border-radius: 10px; background: var(--surface-soft); }
 .upload-item .progress-bar { margin-top: 7px; }
 .annotation-list { display: grid; gap: 8px; }
+.annotation-row-wrap { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 8px; }
+.annotation-select { margin: 0 0 0 2px; }
 .annotation-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; text-align: left; cursor: pointer; }
 .annotation-row.active { border-color: var(--primary); background: #edf7f4; }
 .annotation-row span strong, .annotation-row span small { display: block; }
+.batch-bar { display: grid; gap: 10px; margin-bottom: 12px; padding: 12px; border: 1px solid var(--primary); border-radius: 10px; background: var(--primary-soft); }
+.batch-bar .checkbox { align-items: center; gap: 8px; color: var(--muted); }
+.linked-goal-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.linked-goal-row:last-child { border-bottom: 0; }
+.linked-goal-row strong, .linked-goal-row small { display: block; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .boundary { height: 42px; align-self: end; }
 .goal-progress-row, .new-goal { display: grid; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .goal-progress-row:last-child, .new-goal:last-child { border-bottom: 0; }

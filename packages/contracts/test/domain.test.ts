@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   calculateSessionDuration,
   canTransitionSession,
+  clampAnnotationRange,
   describeMissingReview,
   isGoalProgressValid,
   validateAnnotationRange,
@@ -19,6 +20,28 @@ describe("annotation range", () => {
     expect(validateAnnotationRange(100, 150, 1000)).toMatchObject({ ok: false });
     expect(validateAnnotationRange(900, 1100, 1000)).toMatchObject({ ok: false });
     expect(validateAnnotationRange(100, 250, 1000)).toEqual({ ok: true });
+  });
+});
+
+describe("clamp annotation range while dragging", () => {
+  it("keeps the opposite edge and enforces the minimum 100ms span for edge drags", () => {
+    expect(clampAnnotationRange(150, 200, 1000, 100, "start")).toEqual({ startMs: 100, endMs: 200 });
+    expect(clampAnnotationRange(100, 50, 1000, 100, "end")).toEqual({ startMs: 100, endMs: 200 });
+  });
+
+  it("pins edge drags inside the media bounds", () => {
+    expect(clampAnnotationRange(950, 1450, 1000, 100, "start")).toEqual({ startMs: 900, endMs: 1000 });
+    expect(clampAnnotationRange(950, 1450, 1000, 100, "end")).toEqual({ startMs: 900, endMs: 1000 });
+    expect(clampAnnotationRange(-40, 60, 1000, 100, "start")).toEqual({ startMs: 0, endMs: 100 });
+  });
+
+  it("slides a moved range back without changing its width", () => {
+    expect(clampAnnotationRange(1100, 1600, 1000, 100, "move")).toEqual({ startMs: 500, endMs: 1000 });
+    expect(clampAnnotationRange(-100, 400, 1000, 100, "move")).toEqual({ startMs: 0, endMs: 500 });
+  });
+
+  it("normalizes without a known media duration", () => {
+    expect(clampAnnotationRange(100, 50, null)).toEqual({ startMs: 100, endMs: 200 });
   });
 });
 

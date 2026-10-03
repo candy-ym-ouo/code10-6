@@ -1,5 +1,11 @@
 import type { FastifyPluginAsync } from "fastify";
-import { annotationCreateSchema, annotationListQuerySchema, annotationUpdateSchema, validateAnnotationRange } from "@practice/contracts";
+import {
+  annotationBatchUpdateSchema,
+  annotationCreateSchema,
+  annotationListQuerySchema,
+  annotationUpdateSchema,
+  validateAnnotationRange,
+} from "@practice/contracts";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { parseOrThrow } from "../lib/validation.js";
@@ -61,9 +67,12 @@ const annotationRoutes: FastifyPluginAsync = async (app) => {
     const input = parseOrThrow(annotationUpdateSchema, request.body);
     const existing = await prisma.annotation.findFirst({
       where: { id, userId: request.authUser!.id },
-      include: { media: { select: { durationMs: true } } },
+      include: { media: { select: { durationMs: true, session: { select: { status: true } } } } },
     });
     if (!existing) throw notFound();
+    if (!["DRAFT", "IN_REVIEW", "COMPLETED"].includes(existing.media.session.status)) {
+      throw new AppError(409, "INVALID_SESSION_STATE", "当前练习状态不能编辑标记");
+    }
     const startMs = input.startMs ?? Number(existing.startMs);
     const endMs = input.endMs ?? Number(existing.endMs);
     const range = validateAnnotationRange(startMs, endMs, existing.media.durationMs ? Number(existing.media.durationMs) : null);
@@ -83,12 +92,71 @@ const annotationRoutes: FastifyPluginAsync = async (app) => {
     return { annotation };
   });
 
+  app.patch("/sessions/:sessionId/annotations/batch", async (request) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const input = parseOrThrow(annotationBatchUpdateSchema, request.body);
+    const session = await prisma.practiceSession.findFirst({
+      where: { id: sessionId, userId: request.authUser!.id },
+      select: { id: true, status: true },
+    });
+    if (!session) throw notFound();
+    if (!["DRAFT", "IN_REVIEW", "COMPLETED"].includes(session.status)) {
+      throw new AppError(409, "INVALID_SESSION_STATE", "当前练习状态不能校正标记");
+    }
+    const ids = Array.from(new Set(input.ids));
+    const owned = await prisma.annotation.findMany({
+      where: { id: { in: ids }, sessionId, userId: request.authUser!.id },
+      select: { id: true },
+    });
+    if (owned.length !== ids.length) {
+      throw new AppError(404, "RESOURCE_NOT_FOUND", "部分标记不存在或不属于当前练习");
+    }
+    const data = {
+      ...(input.type === undefined ? {} : { type: input.type }),
+      ...(input.severity === undefined ? {} : { severity: input.severity }),
+      ...(input.nextAction === undefined ? {} : { nextAction: input.nextAction }),
+    };
+    const annotations = await prisma.$transaction(async (tx) => {
+      // 与删除并发时，锁内若有标记消失则 count 不匹配，整体回滚，不会出现部分写入。
+      const result = await tx.annotation.updateMany({
+        where: { id: { in: ids }, sessionId, userId: request.authUser!.id },
+        data,
+      });
+      if (result.count !== ids.length) {
+        throw new AppError(409, "ANNOTATIONS_CHANGED", "标记已在其他窗口被删除，请刷新后重试");
+      }
+      return tx.annotation.findMany({
+        where: { id: { in: ids }, sessionId },
+        orderBy: [{ startMs: "asc" }, { createdAt: "asc" }],
+        include: { goals: { select: { id: true, title: true, status: true } } },
+      });
+    });
+    return { annotations };
+  });
+
   app.delete("/annotations/:id", async (request) => {
     const { id } = request.params as { id: string };
-    const existing = await prisma.annotation.findFirst({ where: { id, userId: request.authUser!.id }, select: { id: true } });
-    if (!existing) throw notFound();
-    await prisma.annotation.delete({ where: { id } });
-    return { success: true };
+    const userId = request.authUser!.id;
+    const result = await prisma.$transaction(async (tx) => {
+      // 先在应用层显式解除目标关联，再删除标记；并发删除时整段为空，返回 404，
+      // 不依赖隐式 ON DELETE SET NULL，也绝不会留下悬空的 annotation_id。
+      const existing = await tx.annotation.findFirst({
+        where: { id, userId },
+        select: { id: true, goals: { select: { id: true } } },
+      });
+      if (!existing) return null;
+      const unlinkedGoalIds = existing.goals.map((goal) => goal.id);
+      if (unlinkedGoalIds.length > 0) {
+        await tx.goal.updateMany({
+          where: { id: { in: unlinkedGoalIds }, annotationId: id },
+          data: { annotationId: null },
+        });
+      }
+      await tx.annotation.delete({ where: { id } });
+      return { unlinkedGoalIds };
+    });
+    if (!result) throw notFound();
+    return { success: true, unlinkedGoalIds: result.unlinkedGoalIds };
   });
 };
 

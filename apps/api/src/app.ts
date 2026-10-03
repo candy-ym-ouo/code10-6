@@ -78,6 +78,11 @@ export async function buildApp() {
       if (error.code === "P2025") {
         return sendError(reply, new AppError(404, "RESOURCE_NOT_FOUND", "资源不存在或无权访问"), request.id);
       }
+      // P2003：外键约束失败，例如目标关联的标记恰好在并发请求中被删除。
+      // 返回冲突让客户端刷新，而不是 500；删除路径已先解除关联，不会留下悬空引用。
+      if (error.code === "P2003") {
+        return sendError(reply, new AppError(409, "RESOURCE_CONFLICT", "关联资源已被删除或发生变更，请刷新后重试"), request.id);
+      }
     }
     if ("statusCode" in error && error.statusCode === 429) return sendError(reply, new AppError(429, "RATE_LIMITED", "请求过于频繁，请稍后重试"), request.id);
     request.log.error({ err: error }, "unhandled request error");
